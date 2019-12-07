@@ -1,4 +1,5 @@
 /* Copyright (c) 2018 The Linux Foundation. All rights reserved.
+ * Copyright (C) 2019 XiaoMi, Inc.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -503,9 +504,6 @@ static int smb5_parse_dt(struct smb5 *chip)
 
 	chg->moisture_protection_enabled = of_property_read_bool(node,
 					"qcom,moisture-protection-enable");
-
-	chg->fcc_stepper_enable = of_property_read_bool(node,
-					"qcom,fcc-stepping-enable");
 
 	return 0;
 }
@@ -1261,7 +1259,6 @@ static enum power_supply_property smb5_batt_props[] = {
 	POWER_SUPPLY_PROP_CYCLE_COUNT,
 	POWER_SUPPLY_PROP_RECHARGE_SOC,
 	POWER_SUPPLY_PROP_CHARGE_FULL,
-	POWER_SUPPLY_PROP_FCC_STEPPER_ENABLE,
 };
 
 #define ITERM_SCALING_FACTOR_PMI632	1525
@@ -1417,9 +1414,6 @@ static int smb5_batt_get_prop(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_CHARGE_FULL:
 		rc = smblib_get_prop_from_bms(chg,
 				POWER_SUPPLY_PROP_CHARGE_FULL, val);
-		break;
-	case POWER_SUPPLY_PROP_FCC_STEPPER_ENABLE:
-		val->intval = chg->fcc_stepper_enable;
 		break;
 	default:
 		pr_err("batt power supply prop %d not supported\n", psp);
@@ -2000,20 +1994,11 @@ static int smb5_init_hw(struct smb5 *chip)
 
 	/*
 	 * PMI632 based hw init:
-	 * - Enable STAT pin function on SMB_EN
 	 * - Rerun APSD to ensure proper charger detection if device
 	 *   boots with charger connected.
 	 * - Initialize flash module for PMI632
 	 */
 	if (chg->smb_version == PMI632_SUBTYPE) {
-		rc = smblib_masked_write(chg, MISC_SMB_EN_CMD_REG,
-					EN_STAT_CMD_BIT, EN_STAT_CMD_BIT);
-		if (rc < 0) {
-			dev_err(chg->dev, "Couldn't configure SMB_EN rc=%d\n",
-					rc);
-			return rc;
-		}
-
 		schgm_flash_init(chg);
 		smblib_rerun_apsd_if_required(chg);
 	}

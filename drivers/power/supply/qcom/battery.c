@@ -1,4 +1,5 @@
 /* Copyright (c) 2018 The Linux Foundation. All rights reserved.
+ * Copyright (C) 2019 XiaoMi, Inc.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -45,15 +46,19 @@
 #define USBIN_I_VOTER			"USBIN_I_VOTER"
 #define PL_FCC_LOW_VOTER		"PL_FCC_LOW_VOTER"
 #define ICL_LIMIT_VOTER			"ICL_LIMIT_VOTER"
-#define FCC_STEPPER_VOTER		"FCC_STEPPER_VOTER"
+#define PL_HIGH_CAPACITY_VOTER          "PL_HIGH_CAPACITY_VOTER"
+
+#define CONFIG_SLAVE_PCT	65
 
 struct pl_data {
 	int			pl_mode;
 	int			pl_batfet_mode;
 	int			pl_min_icl_ua;
 	int			slave_pct;
+#ifdef CONFIG_CHARGER_BQ25910_SLAVE
+	int			const_slave_pct;
+#endif
 	int			slave_fcc_ua;
-	int			main_fcc_ua;
 	int			restricted_current;
 	bool			restricted_charging_enabled;
 	struct votable		*fcc_votable;
@@ -67,30 +72,19 @@ struct pl_data {
 	struct work_struct	pl_disable_forever_work;
 	struct work_struct	pl_taper_work;
 	struct delayed_work	pl_awake_work;
-	struct delayed_work	fcc_stepper_work;
 	bool			taper_work_running;
 	struct power_supply	*main_psy;
 	struct power_supply	*pl_psy;
 	struct power_supply	*batt_psy;
 	struct power_supply	*usb_psy;
-	struct power_supply	*dc_psy;
 	int			charge_type;
 	int			total_settled_ua;
 	int			pl_settled_ua;
 	int			pl_fcc_max;
-	int			fcc_stepper_enable;
-	int			main_step_fcc_dir;
-	int			main_step_fcc_count;
-	int			main_step_fcc_residual;
-	int			parallel_step_fcc_dir;
-	int			parallel_step_fcc_count;
-	int			parallel_step_fcc_residual;
-	int			step_fcc;
 	u32			wa_flags;
 	struct class		qcom_batt_class;
 	struct wakeup_source	*pl_ws;
 	struct notifier_block	nb;
-	bool			pl_disable;
 	int			taper_entry_fv;
 };
 
@@ -102,10 +96,9 @@ enum print_reason {
 
 enum {
 	AICL_RERUN_WA_BIT	= BIT(0),
-	FORCE_INOV_DISABLE_BIT	= BIT(1),
 };
 
-static int debug_mask;
+static int debug_mask = PR_PARALLEL;
 module_param_named(debug_mask, debug_mask, int, 0600);
 
 #define pl_dbg(chip, reason, fmt, ...)				\
@@ -123,7 +116,9 @@ enum {
 	SLAVE_PCT,
 	RESTRICT_CHG_ENABLE,
 	RESTRICT_CHG_CURRENT,
-	FCC_STEPPING_IN_PROGRESS,
+#ifdef CONFIG_CHARGER_BQ25910_SLAVE
+	CONST_SLAVE_PCT,
+#endif
 };
 
 /*******
@@ -271,6 +266,7 @@ static void split_settled(struct pl_data *chip)
 
 	chip->total_settled_ua = total_settled_ua;
 	chip->pl_settled_ua = slave_ua;
+
 }
 
 static ssize_t version_show(struct class *c, struct class_attribute *attr,
@@ -303,7 +299,14 @@ static ssize_t slave_pct_store(struct class *c, struct class_attribute *attr,
 	if (kstrtoul(ubuf, 10, &val))
 		return -EINVAL;
 
+#ifdef CONFIG_CHARGER_BQ25910_SLAVE
+	if (chip->const_slave_pct > 0)
+		chip->slave_pct = chip->const_slave_pct;
+	else
+		chip->slave_pct = val;
+#else
 	chip->slave_pct = val;
+#endif
 
 	rc = validate_parallel_icl(chip, &disable);
 	if (rc < 0)
@@ -316,6 +319,31 @@ static ssize_t slave_pct_store(struct class *c, struct class_attribute *attr,
 
 	return count;
 }
+
+#ifdef CONFIG_CHARGER_BQ25910_SLAVE
+static ssize_t const_slave_pct_show(struct class *c, struct class_attribute *attr,
+			char *ubuf)
+{
+	struct pl_data *chip = container_of(c, struct pl_data,
+			qcom_batt_class);
+
+	return snprintf(ubuf, PAGE_SIZE, "%d\n", chip->const_slave_pct);
+}
+
+static ssize_t const_slave_pct_store(struct class *c, struct class_attribute *attr,
+			const char *ubuf, size_t count)
+{
+	struct pl_data *chip = container_of(c, struct pl_data, qcom_batt_class);
+	unsigned long val;
+
+	if (kstrtoul(ubuf, 10, &val))
+		return -EINVAL;
+
+	chip->const_slave_pct = val;
+
+	return count;
+}
+#endif
 
 /************************
  * RESTRICTED CHARGIGNG *
@@ -385,18 +413,6 @@ static ssize_t restrict_cur_store(struct class *c, struct class_attribute *attr,
 	return count;
 }
 
-/****************************
- * FCC STEPPING IN PROGRESS *
- ****************************/
-static ssize_t fcc_stepping_in_progress_show(struct class *c,
-			struct class_attribute *attr, char *ubuf)
-{
-	struct pl_data *chip = container_of(c, struct pl_data,
-				qcom_batt_class);
-
-	return snprintf(ubuf, PAGE_SIZE, "%d\n", chip->step_fcc);
-}
-
 static struct class_attribute pl_attributes[] = {
 	[VER]			= __ATTR_RO(version),
 	[SLAVE_PCT]		= __ATTR(parallel_pct, 0644,
@@ -405,8 +421,10 @@ static struct class_attribute pl_attributes[] = {
 					restrict_chg_show, restrict_chg_store),
 	[RESTRICT_CHG_CURRENT]	= __ATTR(restricted_current, 0644,
 					restrict_cur_show, restrict_cur_store),
-	[FCC_STEPPING_IN_PROGRESS]
-				= __ATTR_RO(fcc_stepping_in_progress),
+#ifdef CONFIG_CHARGER_BQ25910_SLAVE
+	[CONST_SLAVE_PCT]       = __ATTR(const_parallel_pct, 0644,
+					const_slave_pct_show, const_slave_pct_store),
+#endif
 	__ATTR_NULL,
 };
 
@@ -414,10 +432,6 @@ static struct class_attribute pl_attributes[] = {
  *  FCC  *
  **********/
 #define EFFICIENCY_PCT	80
-#define FCC_STEP_SIZE_UA 100000
-#define FCC_STEP_UPDATE_DELAY_MS 1000
-#define STEP_UP 1
-#define STEP_DOWN -1
 static void get_fcc_split(struct pl_data *chip, int total_ua,
 			int *master_ua, int *slave_ua)
 {
@@ -468,47 +482,6 @@ static void get_fcc_split(struct pl_data *chip, int total_ua,
 		*master_ua = max(0, total_ua);
 	else
 		*master_ua = max(0, total_ua - *slave_ua);
-}
-
-static void get_fcc_stepper_params(struct pl_data *chip, int main_fcc_ua,
-			int parallel_fcc_ua)
-{
-	union power_supply_propval pval = {0, };
-	int rc;
-
-	/* Read current FCC of main charger */
-	rc = power_supply_get_property(chip->main_psy,
-		POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX, &pval);
-	if (rc < 0) {
-		pr_err("Couldn't get main charger current fcc, rc=%d\n", rc);
-		return;
-	}
-	chip->main_fcc_ua = pval.intval;
-
-	chip->main_step_fcc_dir = (main_fcc_ua > pval.intval) ?
-				STEP_UP : STEP_DOWN;
-	chip->main_step_fcc_count = abs((main_fcc_ua - pval.intval) /
-				FCC_STEP_SIZE_UA);
-	chip->main_step_fcc_residual = (main_fcc_ua - pval.intval) %
-				FCC_STEP_SIZE_UA;
-
-	chip->parallel_step_fcc_dir = (parallel_fcc_ua > chip->slave_fcc_ua) ?
-				STEP_UP : STEP_DOWN;
-	chip->parallel_step_fcc_count = abs((parallel_fcc_ua -
-				chip->slave_fcc_ua) / FCC_STEP_SIZE_UA);
-	chip->parallel_step_fcc_residual = (parallel_fcc_ua -
-				chip->slave_fcc_ua) % FCC_STEP_SIZE_UA;
-
-	if (chip->parallel_step_fcc_count || chip->parallel_step_fcc_residual
-		|| chip->main_step_fcc_count || chip->main_step_fcc_residual)
-		chip->step_fcc = 1;
-
-	pr_debug("Main FCC Stepper parameters: main_step_direction: %d, main_step_count: %d, main_residual_fcc: %d\n",
-		chip->main_step_fcc_dir, chip->main_step_fcc_count,
-		chip->main_step_fcc_residual);
-	pr_debug("Parallel FCC Stepper parameters: parallel_step_direction: %d, parallel_step_count: %d, parallel_residual_fcc: %d\n",
-		chip->parallel_step_fcc_dir, chip->parallel_step_fcc_count,
-		chip->parallel_step_fcc_residual);
 }
 
 #define MINIMUM_PARALLEL_FCC_UA		500000
@@ -628,195 +601,6 @@ static int pl_fcc_vote_callback(struct votable *votable, void *data,
 	rerun_election(chip->pl_disable_votable);
 
 	return 0;
-}
-
-static void fcc_stepper_work(struct work_struct *work)
-{
-	struct pl_data *chip = container_of(work, struct pl_data,
-			fcc_stepper_work.work);
-	union power_supply_propval pval = {0, };
-	int reschedule_ms = 0, rc = 0, charger_present = 0;
-	int main_fcc = chip->main_fcc_ua;
-	int parallel_fcc = chip->slave_fcc_ua;
-
-	/* Check whether USB is present or not */
-	rc = power_supply_get_property(chip->usb_psy,
-				POWER_SUPPLY_PROP_PRESENT, &pval);
-	if (rc < 0)
-		pr_err("Couldn't get USB Present status, rc=%d\n", rc);
-
-	charger_present = pval.intval;
-
-	/*Check whether DC charger is present or not */
-	if (!chip->dc_psy)
-		chip->dc_psy = power_supply_get_by_name("dc");
-	if (chip->dc_psy) {
-		rc = power_supply_get_property(chip->dc_psy,
-				POWER_SUPPLY_PROP_PRESENT, &pval);
-		if (rc < 0)
-			pr_err("Couldn't get DC Present status, rc=%d\n", rc);
-
-		charger_present |= pval.intval;
-	}
-
-	/*
-	 * If USB is not present, then set parallel FCC to min value and
-	 * main FCC to the effective value of FCC votable and exit.
-	 */
-	if (!charger_present) {
-		/* Disable parallel */
-		parallel_fcc = 0;
-
-		if (chip->pl_psy) {
-			pval.intval = 1;
-			rc = power_supply_set_property(chip->pl_psy,
-				POWER_SUPPLY_PROP_INPUT_SUSPEND, &pval);
-			if (rc < 0) {
-				pr_err("Couldn't change slave suspend state rc=%d\n",
-					rc);
-				goto out;
-			}
-
-			chip->pl_disable = true;
-			power_supply_changed(chip->pl_psy);
-		}
-
-		main_fcc = get_effective_result_locked(chip->fcc_votable);
-		pval.intval = main_fcc;
-		rc = power_supply_set_property(chip->main_psy,
-			POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX, &pval);
-		if (rc < 0) {
-			pr_err("Couldn't set main charger fcc, rc=%d\n", rc);
-			goto out;
-		}
-
-		goto stepper_exit;
-	}
-
-	if (chip->main_step_fcc_count) {
-		main_fcc += (FCC_STEP_SIZE_UA * chip->main_step_fcc_dir);
-		chip->main_step_fcc_count--;
-		reschedule_ms = FCC_STEP_UPDATE_DELAY_MS;
-	} else if (chip->main_step_fcc_residual) {
-		main_fcc += chip->main_step_fcc_residual;
-		chip->main_step_fcc_residual = 0;
-	}
-
-	if (chip->parallel_step_fcc_count) {
-		parallel_fcc += (FCC_STEP_SIZE_UA *
-			chip->parallel_step_fcc_dir);
-		chip->parallel_step_fcc_count--;
-		reschedule_ms = FCC_STEP_UPDATE_DELAY_MS;
-	} else if (chip->parallel_step_fcc_residual) {
-		parallel_fcc += chip->parallel_step_fcc_residual;
-		chip->parallel_step_fcc_residual = 0;
-	}
-
-	if (parallel_fcc < chip->slave_fcc_ua) {
-		/* Set parallel FCC */
-		if (chip->pl_psy && !chip->pl_disable) {
-			if (parallel_fcc < MINIMUM_PARALLEL_FCC_UA) {
-				pval.intval = 1;
-				rc = power_supply_set_property(chip->pl_psy,
-					POWER_SUPPLY_PROP_INPUT_SUSPEND, &pval);
-				if (rc < 0) {
-					pr_err("Couldn't change slave suspend state rc=%d\n",
-						rc);
-					goto out;
-				}
-
-				if (IS_USBIN(chip->pl_mode))
-					split_settled(chip);
-
-				parallel_fcc = 0;
-				chip->parallel_step_fcc_count = 0;
-				chip->parallel_step_fcc_residual = 0;
-				chip->total_settled_ua = 0;
-				chip->pl_settled_ua = 0;
-				chip->pl_disable = true;
-				power_supply_changed(chip->pl_psy);
-			} else {
-				/* Set Parallel FCC */
-				pval.intval = parallel_fcc;
-				rc = power_supply_set_property(chip->pl_psy,
-				POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX,
-					&pval);
-				if (rc < 0) {
-					pr_err("Couldn't set parallel charger fcc, rc=%d\n",
-						rc);
-					goto out;
-				}
-			}
-		}
-
-		/* Set main FCC */
-		pval.intval = main_fcc;
-		rc = power_supply_set_property(chip->main_psy,
-			POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX, &pval);
-		if (rc < 0) {
-			pr_err("Couldn't set main charger fcc, rc=%d\n", rc);
-			goto out;
-		}
-	} else {
-		/* Set main FCC */
-		pval.intval = main_fcc;
-		rc = power_supply_set_property(chip->main_psy,
-			POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX, &pval);
-		if (rc < 0) {
-			pr_err("Couldn't set main charger fcc, rc=%d\n", rc);
-			goto out;
-		}
-
-		/* Set parallel FCC */
-		if (chip->pl_psy) {
-			pval.intval = parallel_fcc;
-			rc = power_supply_set_property(chip->pl_psy,
-				POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX,
-				&pval);
-			if (rc < 0) {
-				pr_err("Couldn't set parallel charger fcc, rc=%d\n",
-					rc);
-				goto out;
-			}
-
-			/*
-			 * Enable parallel charger only if it was disabled
-			 * earlier and configured slave fcc is greater than or
-			 * equal to minimum parallel FCC value.
-			 */
-			if (chip->pl_disable && parallel_fcc
-					>= MINIMUM_PARALLEL_FCC_UA) {
-				pval.intval = 0;
-				rc = power_supply_set_property(chip->pl_psy,
-					POWER_SUPPLY_PROP_INPUT_SUSPEND, &pval);
-				if (rc < 0) {
-					pr_err("Couldn't change slave suspend state rc=%d\n",
-						rc);
-					goto out;
-				}
-
-				if (IS_USBIN(chip->pl_mode))
-					split_settled(chip);
-
-				chip->pl_disable = false;
-				power_supply_changed(chip->pl_psy);
-			}
-		}
-	}
-
-stepper_exit:
-	chip->main_fcc_ua = main_fcc;
-	chip->slave_fcc_ua = parallel_fcc;
-
-	if (reschedule_ms) {
-		schedule_delayed_work(&chip->fcc_stepper_work,
-				msecs_to_jiffies(reschedule_ms));
-		pr_debug("Rescheduling FCC_STEPPER work\n");
-		return;
-	}
-out:
-	chip->step_fcc = 0;
-	vote(chip->pl_awake_votable, FCC_STEPPER_VOTER, false, 0);
 }
 
 #define PARALLEL_FLOAT_VOLTAGE_DELTA_UV 50000
@@ -957,17 +741,6 @@ static bool is_main_available(struct pl_data *chip)
 	return !!chip->main_psy;
 }
 
-static bool is_batt_available(struct pl_data *chip)
-{
-	if (!chip->batt_psy)
-		chip->batt_psy = power_supply_get_by_name("battery");
-
-	if (!chip->batt_psy)
-		return false;
-
-	return true;
-}
-
 static int pl_disable_vote_callback(struct votable *votable,
 		void *data, int pl_disable, const char *client)
 {
@@ -979,30 +752,6 @@ static int pl_disable_vote_callback(struct votable *votable,
 
 	if (!is_main_available(chip))
 		return -ENODEV;
-
-	if (!is_batt_available(chip))
-		return -ENODEV;
-
-	if (!chip->usb_psy)
-		chip->usb_psy = power_supply_get_by_name("usb");
-	if (!chip->usb_psy) {
-		pr_err("Couldn't get usb psy\n");
-		return -ENODEV;
-	}
-
-	rc = power_supply_get_property(chip->batt_psy,
-			POWER_SUPPLY_PROP_FCC_STEPPER_ENABLE, &pval);
-	if (rc < 0) {
-		pr_err("Couldn't read FCC step update status, rc=%d\n", rc);
-		return rc;
-	}
-	chip->fcc_stepper_enable = pval.intval;
-	pr_debug("FCC Stepper %s\n", pval.intval ? "enabled" : "disabled");
-
-	if (chip->fcc_stepper_enable) {
-		cancel_delayed_work_sync(&chip->fcc_stepper_work);
-		vote(chip->pl_awake_votable, FCC_STEPPER_VOTER, false, 0);
-	}
 
 	total_fcc_ua = get_effective_result_locked(chip->fcc_votable);
 
@@ -1039,86 +788,72 @@ static int pl_disable_vote_callback(struct votable *votable,
 		get_fcc_split(chip, total_fcc_ua, &master_fcc_ua,
 				&slave_fcc_ua);
 
-		if (chip->fcc_stepper_enable) {
-			get_fcc_stepper_params(chip, master_fcc_ua,
-					slave_fcc_ua);
-			if (chip->step_fcc) {
-				vote(chip->pl_awake_votable, FCC_STEPPER_VOTER,
-					true, 0);
-				schedule_delayed_work(&chip->fcc_stepper_work,
-					0);
-				}
-		} else {
-			/*
-			 * If there is an increase in slave share
-			 * (Also handles parallel enable case)
-			 *	Set Main ICL then slave FCC
-			 * else
-			 * (Also handles parallel disable case)
-			 *	Set slave ICL then main FCC.
-			 */
-			if (slave_fcc_ua > chip->slave_fcc_ua) {
-				pval.intval = master_fcc_ua;
-				rc = power_supply_set_property(chip->main_psy,
+		/*
+		 * If there is an increase in slave share
+		 * (Also handles parallel enable case)
+		 *	Set Main ICL then slave FCC
+		 * else
+		 * (Also handles parallel disable case)
+		 *	Set slave ICL then main FCC.
+		 */
+		if (slave_fcc_ua > chip->slave_fcc_ua) {
+			pval.intval = master_fcc_ua;
+			rc = power_supply_set_property(chip->main_psy,
 				POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX,
-					&pval);
-				if (rc < 0) {
-					pr_err("Could not set main fcc, rc=%d\n",
-						rc);
-					return rc;
-				}
-
-				pval.intval = slave_fcc_ua;
-				rc = power_supply_set_property(chip->pl_psy,
-				POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX,
-					&pval);
-				if (rc < 0) {
-					pr_err("Couldn't set parallel fcc, rc=%d\n",
-						rc);
-					return rc;
-				}
-
-				chip->slave_fcc_ua = slave_fcc_ua;
-			} else {
-				pval.intval = slave_fcc_ua;
-				rc = power_supply_set_property(chip->pl_psy,
-				POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX,
-					&pval);
-				if (rc < 0) {
-					pr_err("Couldn't set parallel fcc, rc=%d\n",
-						rc);
-					return rc;
-				}
-
-				chip->slave_fcc_ua = slave_fcc_ua;
-
-				pval.intval = master_fcc_ua;
-				rc = power_supply_set_property(chip->main_psy,
-				POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX,
-					&pval);
-				if (rc < 0) {
-					pr_err("Could not set main fcc, rc=%d\n",
-						rc);
-					return rc;
-				}
+				&pval);
+			if (rc < 0) {
+				pr_err("Could not set main fcc, rc=%d\n", rc);
+				return rc;
 			}
 
-			/*
-			 * Enable will be called with a valid pl_psy always. The
-			 * PARALLEL_PSY_VOTER keeps it disabled unless a pl_psy
-			 * is seen.
-			 */
-			pval.intval = 0;
+			pval.intval = slave_fcc_ua;
 			rc = power_supply_set_property(chip->pl_psy,
-				POWER_SUPPLY_PROP_INPUT_SUSPEND, &pval);
-			if (rc < 0)
-				pr_err("Couldn't change slave suspend state rc=%d\n",
-					rc);
+				POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX,
+				&pval);
+			if (rc < 0) {
+				pr_err("Couldn't set parallel fcc, rc=%d\n",
+						rc);
+				return rc;
+			}
 
-			if (IS_USBIN(chip->pl_mode))
-				split_settled(chip);
+			chip->slave_fcc_ua = slave_fcc_ua;
+		} else {
+			pval.intval = slave_fcc_ua;
+			rc = power_supply_set_property(chip->pl_psy,
+				POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX,
+				&pval);
+			if (rc < 0) {
+				pr_err("Couldn't set parallel fcc, rc=%d\n",
+						rc);
+				return rc;
+			}
+
+			chip->slave_fcc_ua = slave_fcc_ua;
+
+			pval.intval = master_fcc_ua;
+			rc = power_supply_set_property(chip->main_psy,
+				POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX,
+				&pval);
+			if (rc < 0) {
+				pr_err("Could not set main fcc, rc=%d\n", rc);
+				return rc;
+			}
 		}
 
+		/*
+		 * Enable will be called with a valid pl_psy always. The
+		 * PARALLEL_PSY_VOTER keeps it disabled unless a pl_psy
+		 * is seen.
+		 */
+		pval.intval = 0;
+		rc = power_supply_set_property(chip->pl_psy,
+				POWER_SUPPLY_PROP_INPUT_SUSPEND, &pval);
+		if (rc < 0)
+			pr_err("Couldn't change slave suspend state rc=%d\n",
+				rc);
+
+		if (IS_USBIN(chip->pl_mode))
+			split_settled(chip);
 		/*
 		 * we could have been enabled while in taper mode,
 		 *  start the taper work if so
@@ -1144,56 +879,39 @@ static int pl_disable_vote_callback(struct votable *votable,
 			(master_fcc_ua * 100) / total_fcc_ua,
 			(slave_fcc_ua * 100) / total_fcc_ua);
 	} else {
-		if (!chip->fcc_stepper_enable) {
-			if (IS_USBIN(chip->pl_mode))
-				split_settled(chip);
+		if (IS_USBIN(chip->pl_mode))
+			split_settled(chip);
 
-			/* pl_psy may be NULL while in the disable branch */
-			if (chip->pl_psy) {
-				pval.intval = 1;
-				rc = power_supply_set_property(chip->pl_psy,
+		/* pl_psy may be NULL while in the disable branch */
+		if (chip->pl_psy) {
+			pval.intval = 1;
+			rc = power_supply_set_property(chip->pl_psy,
 					POWER_SUPPLY_PROP_INPUT_SUSPEND, &pval);
-				if (rc < 0)
-					pr_err("Couldn't change slave suspend state rc=%d\n",
-						rc);
-			}
-
-			/* main psy gets all share */
-			pval.intval = total_fcc_ua;
-			rc = power_supply_set_property(chip->main_psy,
-				POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX,
-				&pval);
-			if (rc < 0) {
-				pr_err("Could not set main fcc, rc=%d\n", rc);
-				return rc;
-			}
-
-			/* reset parallel FCC */
-			chip->slave_fcc_ua = 0;
-			chip->total_settled_ua = 0;
-			chip->pl_settled_ua = 0;
-		} else {
-			get_fcc_stepper_params(chip, total_fcc_ua, 0);
-			if (chip->step_fcc) {
-				vote(chip->pl_awake_votable, FCC_STEPPER_VOTER,
-					true, 0);
-				schedule_delayed_work(&chip->fcc_stepper_work,
-					0);
-			}
+			if (rc < 0)
+				pr_err("Couldn't change slave suspend state rc=%d\n",
+					rc);
 		}
 
+		/* main psy gets all share */
+		pval.intval = total_fcc_ua;
+		rc = power_supply_set_property(chip->main_psy,
+				POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX,
+				&pval);
+		if (rc < 0) {
+			pr_err("Could not set main fcc, rc=%d\n", rc);
+			return rc;
+		}
+
+		/* reset parallel FCC */
+		chip->slave_fcc_ua = 0;
 		rerun_election(chip->fv_votable);
 
 		cancel_delayed_work_sync(&chip->pl_awake_work);
 		schedule_delayed_work(&chip->pl_awake_work,
 						msecs_to_jiffies(5000));
-	}
 
-	/* notify parallel state change */
-	if (chip->pl_psy && (chip->pl_disable != pl_disable)
-				&& !chip->fcc_stepper_enable) {
-		power_supply_changed(chip->pl_psy);
-		chip->pl_disable = (bool)pl_disable;
+		chip->total_settled_ua = 0;
+		chip->pl_settled_ua = 0;
 	}
 
 	pl_dbg(chip, PR_PARALLEL, "parallel charging %s\n",
@@ -1226,6 +944,17 @@ static int pl_awake_vote_callback(struct votable *votable,
 	return 0;
 }
 
+static bool is_batt_available(struct pl_data *chip)
+{
+	if (!chip->batt_psy)
+		chip->batt_psy = power_supply_get_by_name("battery");
+
+	if (!chip->batt_psy)
+		return false;
+
+	return true;
+}
+
 static bool is_parallel_available(struct pl_data *chip)
 {
 	union power_supply_propval pval = {0, };
@@ -1253,8 +982,7 @@ static bool is_parallel_available(struct pl_data *chip)
 	chip->pl_mode = pval.intval;
 
 	/* Disable autonomous votage increments for USBIN-USBIN */
-	if (IS_USBIN(chip->pl_mode)
-			&& (chip->wa_flags & FORCE_INOV_DISABLE_BIT)) {
+	if (IS_USBIN(chip->pl_mode)) {
 		if (!chip->hvdcp_hw_inov_dis_votable)
 			chip->hvdcp_hw_inov_dis_votable =
 					find_votable("HVDCP_HW_INOV_DIS");
@@ -1291,10 +1019,56 @@ static bool is_parallel_available(struct pl_data *chip)
 	return true;
 }
 
+#ifdef CONFIG_CHARGER_BQ25910_SLAVE
+#define TAPER_CAPACITY_THR	90
+#define TAPER_VBATT_THR		4395000
+#endif
 static void handle_main_charge_type(struct pl_data *chip)
 {
 	union power_supply_propval pval = {0, };
 	int rc;
+
+#ifdef CONFIG_CHARGER_BQ25910_SLAVE
+	int taper_soc = 0;
+	int taper_vbatt = 0;
+
+	/*
+	 * If charge type failed to change to taper, pl_taper_work cannot
+	 * be launched anymore, so parallel charging cannot be disabled,
+	 * if battery capacity is high, do not allow parallel charging
+	 * to protect the battery avoiding battery over voltage if
+	 * pm670 charge type may failed to change from fast to taper.
+	 */
+	rc = power_supply_get_property(chip->batt_psy,
+			POWER_SUPPLY_PROP_CAPACITY, &pval);
+	if (rc < 0) {
+		pr_err("Couldn't get batt capacity rc=%d\n", rc);
+		return;
+	}
+	taper_soc = pval.intval;
+
+	rc = power_supply_get_property(chip->batt_psy,
+			POWER_SUPPLY_PROP_VOLTAGE_NOW, &pval);
+	if (rc < 0) {
+		pr_err("Couldn't get batt voltage rc=%d\n", rc);
+		return;
+	}
+	taper_vbatt = pval.intval;
+
+	if (!get_effective_result_locked(chip->pl_disable_votable)) {
+		if ((taper_soc > TAPER_CAPACITY_THR)
+				|| (taper_vbatt > TAPER_VBATT_THR)) {
+			pr_err("High capacity or Vbatt above 4395mV, disable pl\n");
+			vote(chip->pl_disable_votable, PL_HIGH_CAPACITY_VOTER, true, 0);
+			return;
+		}
+	} else {
+		if ((taper_soc < TAPER_CAPACITY_THR - 2)
+				&& (taper_vbatt < TAPER_VBATT_THR - 40000)) {
+			vote(chip->pl_disable_votable, PL_HIGH_CAPACITY_VOTER, false, 0);
+		}
+	}
+#endif
 
 	rc = power_supply_get_property(chip->batt_psy,
 			       POWER_SUPPLY_PROP_CHARGE_TYPE, &pval);
@@ -1548,9 +1322,7 @@ static void pl_config_init(struct pl_data *chip, int smb_version)
 	switch (smb_version) {
 	case PMI8998_SUBTYPE:
 	case PM660_SUBTYPE:
-		chip->wa_flags = AICL_RERUN_WA_BIT | FORCE_INOV_DISABLE_BIT;
-		break;
-	case PMI632_SUBTYPE:
+		chip->wa_flags = AICL_RERUN_WA_BIT;
 		break;
 	default:
 		break;
@@ -1638,7 +1410,6 @@ int qcom_batt_init(int smb_version)
 	INIT_WORK(&chip->pl_taper_work, pl_taper_work);
 	INIT_WORK(&chip->pl_disable_forever_work, pl_disable_forever_work);
 	INIT_DELAYED_WORK(&chip->pl_awake_work, pl_awake_work);
-	INIT_DELAYED_WORK(&chip->fcc_stepper_work, fcc_stepper_work);
 
 	rc = pl_register_notifier(chip);
 	if (rc < 0) {
@@ -1652,7 +1423,6 @@ int qcom_batt_init(int smb_version)
 		goto unreg_notifier;
 	}
 
-	chip->pl_disable = true;
 	chip->qcom_batt_class.name = "qcom-battery",
 	chip->qcom_batt_class.owner = THIS_MODULE,
 	chip->qcom_batt_class.class_attrs = pl_attributes;
@@ -1663,6 +1433,9 @@ int qcom_batt_init(int smb_version)
 		goto unreg_notifier;
 	}
 
+#ifdef CONFIG_CHARGER_BQ25910_SLAVE
+	chip->const_slave_pct = CONFIG_SLAVE_PCT;
+#endif
 	the_chip = chip;
 
 	return 0;
@@ -1694,7 +1467,6 @@ void qcom_batt_deinit(void)
 	cancel_work_sync(&chip->pl_taper_work);
 	cancel_work_sync(&chip->pl_disable_forever_work);
 	cancel_delayed_work_sync(&chip->pl_awake_work);
-	cancel_delayed_work_sync(&chip->fcc_stepper_work);
 
 	power_supply_unreg_notifier(&chip->nb);
 	destroy_votable(chip->pl_enable_votable_indirect);
