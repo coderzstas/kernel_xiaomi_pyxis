@@ -716,14 +716,11 @@ static inline void pte_update(unsigned long addr, pteval_t mask,
 				  pteval_t prot, struct mm_struct *mm)
 {
 	struct pte_data data;
-	struct mm_struct *apply_mm = mm;
 
 	data.mask = mask;
 	data.val = prot;
 
-	if (addr >= PAGE_OFFSET)
-		apply_mm = &init_mm;
-	apply_to_page_range(apply_mm, addr, SECTION_SIZE, __pte_update, &data);
+	apply_to_page_range(mm, addr, SECTION_SIZE, __pte_update, &data);
 	flush_tlb_kernel_range(addr, addr + SECTION_SIZE);
 }
 
