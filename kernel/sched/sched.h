@@ -2422,11 +2422,7 @@ static inline void __update_min_max_capacity(void)
 	int i;
 	int max_cap = 0, min_cap = INT_MAX;
 
-	for_each_possible_cpu(i) {
-
-		if (!cpu_active(i))
-			continue;
-
+	for_each_online_cpu(i) {
 		max_cap = max(max_cap, cpu_capacity(i));
 		min_cap = min(min_cap, cpu_capacity(i));
 	}
@@ -2691,7 +2687,6 @@ static inline unsigned int power_cost(int cpu, bool max)
 }
 
 extern void walt_sched_energy_populated_callback(void);
-extern void walt_update_min_max_capacity(void);
 
 #else	/* CONFIG_SCHED_WALT */
 
@@ -2825,7 +2820,6 @@ static inline unsigned int power_cost(int cpu, bool max)
 }
 
 static inline void walt_sched_energy_populated_callback(void) { }
-static inline void walt_update_min_max_capacity(void) { }
 
 #endif	/* CONFIG_SCHED_WALT */
 
@@ -2848,4 +2842,16 @@ find_first_cpu_bit(struct task_struct *p, const cpumask_t *search_cpus,
 		   bool *do_rotate, struct find_first_cpu_bit_env *env);
 #else
 #define find_first_cpu_bit(...) -1
+#endif
+
+#ifdef CONFIG_PACKAGE_RUNTIME_INFO
+void __weak update_task_runtime_info(struct task_struct *tsk, u64 delta, int run_on_bcore)
+{
+	return;
+}
+
+void __weak init_task_runtime_info(struct task_struct *tsk)
+{
+	return;
+}
 #endif

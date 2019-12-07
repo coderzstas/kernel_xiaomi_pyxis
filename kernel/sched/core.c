@@ -4,6 +4,7 @@
  *  Kernel scheduler and related syscalls
  *
  *  Copyright (C) 1991-2002  Linus Torvalds
+ *  Copyright (C) 2019 XiaoMi, Inc.
  *
  *  1996-12-23  Modified by Dave Grothe to fix bugs in semaphores and
  *		make semaphores SMP safe
@@ -2334,6 +2335,9 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
 	p->last_cpu_selected_ts		= 0;
 
 	INIT_LIST_HEAD(&p->se.group_node);
+#ifdef CONFIG_PACKAGE_RUNTIME_INFO
+	init_task_runtime_info(p);
+#endif
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	p->se.cfs_rq			= NULL;
@@ -8035,7 +8039,6 @@ int sched_cpu_activate(unsigned int cpu)
 	raw_spin_unlock_irqrestore(&rq->lock, flags);
 
 	update_max_interval();
-	walt_update_min_max_capacity();
 
 	return 0;
 }
@@ -8069,7 +8072,6 @@ int sched_cpu_deactivate(unsigned int cpu)
 		return ret;
 	}
 	sched_domains_numa_masks_clear(cpu);
-	walt_update_min_max_capacity();
 	return 0;
 }
 

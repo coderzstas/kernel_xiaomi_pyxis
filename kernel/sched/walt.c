@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2016-2018, The Linux Foundation. All rights reserved.
+ * Copyright (C) 2019 XiaoMi, Inc.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -774,6 +775,11 @@ migrate_top_tasks(struct task_struct *p, struct rq *src_rq, struct rq *dst_rq)
 			src_rq->prev_top = get_top_index(
 				src_rq->top_tasks_bitmap[src], top_index);
 	}
+}
+
+int big_core(int cpu)
+{
+	return is_max_capacity_cpu(cpu);
 }
 
 void fixup_busy_time(struct task_struct *p, int new_cpu)
@@ -2184,7 +2190,7 @@ static int compute_max_possible_capacity(struct sched_cluster *cluster)
 	return capacity;
 }
 
-void walt_update_min_max_capacity(void)
+static void update_min_max_capacity(void)
 {
 	unsigned long flags;
 
@@ -2410,7 +2416,7 @@ static int cpufreq_notifier_policy(struct notifier_block *nb,
 		return 0;
 
 	if (val == CPUFREQ_REMOVE_POLICY || val == CPUFREQ_CREATE_POLICY) {
-		walt_update_min_max_capacity();
+		update_min_max_capacity();
 		return 0;
 	}
 
