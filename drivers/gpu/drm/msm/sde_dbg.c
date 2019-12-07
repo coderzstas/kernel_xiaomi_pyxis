@@ -1,4 +1,5 @@
 /* Copyright (c) 2009-2018, The Linux Foundation. All rights reserved.
+ * Copyright (C) 2019 XiaoMi, Inc.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -26,10 +27,18 @@
 
 #define SDE_DBG_BASE_MAX		10
 
+#ifdef CONFIG_DRM_SDE_XLOG_DEBUG
 #define DEFAULT_PANIC		1
 #define DEFAULT_REGDUMP		SDE_DBG_DUMP_IN_MEM
 #define DEFAULT_DBGBUS_SDE	SDE_DBG_DUMP_IN_MEM
 #define DEFAULT_DBGBUS_VBIFRT	SDE_DBG_DUMP_IN_MEM
+#else
+#define DEFAULT_PANIC          0
+#define DEFAULT_REGDUMP                SDE_DBG_DUMP_IN_LOG
+#define DEFAULT_DBGBUS_SDE     SDE_DBG_DUMP_IN_LOG
+#define DEFAULT_DBGBUS_VBIFRT  SDE_DBG_DUMP_IN_LOG
+#endif
+
 #define DEFAULT_BASE_REG_CNT	0x100
 #define GROUP_BYTES		4
 #define ROW_BYTES		16
@@ -3047,37 +3056,6 @@ static int sde_dbg_reg_base_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
-/**
- * sde_dbg_reg_base_is_valid_range - verify if requested memory range is valid
- * @off: address offset in bytes
- * @cnt: memory size in bytes
- * Return: true if valid; false otherwise
- */
-static bool sde_dbg_reg_base_is_valid_range(u32 off, u32 cnt)
-{
-	static struct sde_dbg_base *dbg_base = &sde_dbg_base;
-	struct sde_dbg_reg_range *node;
-	struct sde_dbg_reg_base *base;
-
-	pr_debug("check offset=0x%x cnt=0x%x\n", off, cnt);
-
-	list_for_each_entry(base, &dbg_base->reg_base_list, reg_base_head) {
-		list_for_each_entry(node, &base->sub_range_list, head) {
-			pr_debug("%s: start=0x%x end=0x%x\n", node->range_name,
-					node->offset.start, node->offset.end);
-
-			if (node->offset.start <= off
-					&& off <= node->offset.end
-					&& off + cnt <= node->offset.end) {
-				pr_debug("valid range requested\n");
-				return true;
-			}
-		}
-	}
-
-	pr_err("invalid range requested\n");
-	return false;
-}
 
 /**
  * sde_dbg_reg_base_offset_write - set new offset and len to debugfs reg base
@@ -3122,9 +3100,6 @@ static ssize_t sde_dbg_reg_base_offset_write(struct file *file,
 		cnt = dbg->max_offset - off;
 
 	if (cnt == 0)
-		return -EINVAL;
-
-	if (!sde_dbg_reg_base_is_valid_range(off, cnt))
 		return -EINVAL;
 
 	mutex_lock(&sde_dbg_base.mutex);

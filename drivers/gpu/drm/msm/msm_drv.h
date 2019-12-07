@@ -73,6 +73,9 @@ struct msm_gem_vma;
 
 #define TEARDOWN_DEADLOCK_RETRY_MAX 5
 
+extern atomic_t resume_pending;
+extern wait_queue_head_t resume_wait_q;
+
 struct msm_file_private {
 	/* currently we don't do anything useful with this.. but when
 	 * per-context address spaces are supported we'd keep track of
@@ -196,6 +199,12 @@ enum msm_mdp_conn_property {
 
 	/* total # of properties */
 	CONNECTOR_PROP_COUNT
+};
+
+struct msm_vblank_ctrl {
+	struct kthread_work work;
+	struct list_head event_list;
+	spinlock_t lock;
 };
 
 #define MAX_H_TILES_PER_DISPLAY 2
@@ -608,6 +617,8 @@ struct msm_drm_private {
 
 	struct notifier_block vmap_notifier;
 	struct shrinker shrinker;
+
+	struct msm_vblank_ctrl vblank_ctrl;
 
 	/* task holding struct_mutex.. currently only used in submit path
 	 * to detect and reject faults from copy_from_user() for submit
